@@ -210,44 +210,47 @@ public class AppScanBuildStep extends Builder implements SimpleBuildStep, Serial
     public DescriptorImpl getDescriptor() {
         return (DescriptorImpl)super.getDescriptor();
     }
-    
-    @Override
-    public boolean perform(AbstractBuild<?,?> build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
-    	perform((Run<?,?>)build, launcher, listener);
-		return true;
-    }
-    
+
+
+
 	@Override
 	public void perform(@Nonnull Run<?, ?> run, @Nonnull FilePath workspace, @Nonnull Launcher launcher, @Nonnull TaskListener listener) throws InterruptedException, IOException {
-		perform(run, launcher, listener);
+		if(m_scanner != null) {
+			perform(run, launcher, listener);
+		} else {
+            throw new AbortException("Mobile Analyzer is no longer supported, try static analyzer for mobile application");
+		}
 	}
-    
     @Override
     public BuildStepMonitor getRequiredMonitorService() {
     	return BuildStepMonitor.NONE;
     }
+	//To retain backward compatibility
+	protected Object readResolve() {
+		if(m_scanner == null && m_type != null)
+			m_scanner = ScannerFactory.getScanner(m_type, m_target);
+		return this;
+	}
+
     
-    //To retain backward compatibility
-    protected Object readResolve() {
-    	if(m_scanner == null && m_type != null)
-    		m_scanner = ScannerFactory.getScanner(m_type, m_target);
-    	return this;
-    }
-    
-    private Map<String, String> getScanProperties(Run<?,?> build, TaskListener listener) {
-    	VariableResolver<String> resolver = build instanceof AbstractBuild ? new BuildVariableResolver((AbstractBuild<?,?>)build, listener) : null;
-    	Map<String, String> properties = m_scanner.getProperties(resolver);
-		properties.put(CoreConstants.SCANNER_TYPE, m_scanner.getType());
-        properties.put(CoreConstants.APP_ID,  m_application);
-        properties.put(CoreConstants.SCAN_NAME, resolver == null ? m_name : Util.replaceMacro(m_name, resolver) + "_" + SystemUtil.getTimeStamp()); //$NON-NLS-1$
-		properties.put(CoreConstants.EMAIL_NOTIFICATION, Boolean.toString(m_emailNotification));
-		properties.put("APPSCAN_IRGEN_CLIENT", "Jenkins");
-		properties.put("APPSCAN_CLIENT_VERSION", Jenkins.VERSION);
-		properties.put("IRGEN_CLIENT_PLUGIN_VERSION", getPluginVersion());
-		properties.put("ClientType", "jenkins-" + SystemUtil.getOS() + "-" + getPluginVersion());
-		return properties;
-    }
-    
+    private Map<String, String> getScanProperties(Run<?,?> build, TaskListener listener) throws IOException,AbortException {
+		if(m_scanner != null){
+			VariableResolver<String> resolver = build instanceof AbstractBuild ? new BuildVariableResolver((AbstractBuild<?, ?>) build, listener) : null;
+			Map<String, String> properties = m_scanner.getProperties(resolver);
+			properties.put(CoreConstants.SCANNER_TYPE, m_scanner.getType());
+			properties.put(CoreConstants.APP_ID, m_application);
+			properties.put(CoreConstants.SCAN_NAME, resolver == null ? m_name : Util.replaceMacro(m_name, resolver) + "_" + SystemUtil.getTimeStamp()); //$NON-NLS-1$
+			properties.put(CoreConstants.EMAIL_NOTIFICATION, Boolean.toString(m_emailNotification));
+			properties.put("APPSCAN_IRGEN_CLIENT", "Jenkins");
+			properties.put("APPSCAN_CLIENT_VERSION", Jenkins.VERSION);
+			properties.put("IRGEN_CLIENT_PLUGIN_VERSION", getPluginVersion());
+			properties.put("ClientType", "jenkins-" + SystemUtil.getOS() + "-" + getPluginVersion());
+			return properties;
+		}else{
+			throw new AbortException("Mobile Analyzer is no longer supported, try static analyzer for mobile application");
+		}
+	}
+
     private String getPluginVersion() {
     	Plugin tempPlugin = Jenkins.getInstance().getPlugin("appscan");
 
@@ -281,77 +284,74 @@ public class AppScanBuildStep extends Builder implements SimpleBuildStep, Serial
 	}
     
     private void perform(Run<?,?> build, Launcher launcher, TaskListener listener) throws InterruptedException, IOException {
-    	m_authProvider = new JenkinsAuthenticationProvider(m_credentials, build.getParent().getParent());
-    	final IProgress progress = new ScanProgress(listener);
-    	final boolean suspend = m_wait;
-    	final IScan scan = ScanFactory.createScan(getScanProperties(build, listener), progress, m_authProvider);
-        
-    	
-    	IResultsProvider provider = launcher.getChannel().call(new Callable<IResultsProvider, AbortException>() {
-			private static final long serialVersionUID = 1L;
+			m_authProvider = new JenkinsAuthenticationProvider(m_credentials, build.getParent().getParent());
+			final IProgress progress = new ScanProgress(listener);
+			final boolean suspend = m_wait;
+			final IScan scan = ScanFactory.createScan(getScanProperties(build, listener), progress, m_authProvider);
 
-			@Override
-			public void checkRoles(RoleChecker arg0) {
+
+			IResultsProvider provider = launcher.getChannel().call(new Callable<IResultsProvider, AbortException>() {
+				private static final long serialVersionUID = 1L;
+
+				@Override
+				public void checkRoles(RoleChecker arg0) {
+				}
+
+				@Override
+				public IResultsProvider call() throws AbortException {
+					try {
+						setInstallDir();
+						scan.run();
+
+						IResultsProvider provider = new NonCompliantIssuesResultProvider(scan.getScanId(), scan.getType(), scan.getServiceProvider(), progress);
+						provider.setReportFormat(scan.getReportFormat());
+						if (suspend) {
+							progress.setStatus(new Message(Message.INFO, Messages.analysis_running()));
+							m_scanStatus = provider.getStatus();
+
+							int requestCounter = 0;
+							while (m_scanStatus != null && (m_scanStatus.equalsIgnoreCase(CoreConstants.INQUEUE) || m_scanStatus.equalsIgnoreCase(CoreConstants.RUNNING) || m_scanStatus.equalsIgnoreCase(CoreConstants.UNKNOWN)) && requestCounter < 10) {
+								Thread.sleep(60000);
+								if (m_scanStatus.equalsIgnoreCase(CoreConstants.UNKNOWN))
+									requestCounter++;   // In case of internet disconnect, polling the server 10 times to check the connection has established
+								else
+									requestCounter = 0;
+								m_scanStatus = provider.getStatus();
+							}
+						}
+
+						return provider;
+					} catch (ScannerException | InvalidTargetException | InterruptedException e) {
+						throw new AbortException(Messages.error_running_scan(e.getLocalizedMessage()));
+					}
+				}
+			});
+
+			if (suspend && m_scanStatus == null) // to address the status in association with Master and Slave congifuration
+				m_scanStatus = provider.getStatus();
+
+			if (CoreConstants.FAILED.equalsIgnoreCase(m_scanStatus)) {
+				String message = com.hcl.appscan.sdk.Messages.getMessage(ScanConstants.SCAN_FAILED, " Scan Name: " + scan.getName());
+				if (provider.getMessage() != null && provider.getMessage().trim().length() > 0) {
+					message += ", " + provider.getMessage();
+				}
+				build.setDescription(message);
+				throw new AbortException(com.hcl.appscan.sdk.Messages.getMessage(ScanConstants.SCAN_FAILED, (" Scan Id: " + scan.getScanId() +
+						", Scan Name: " + scan.getName())));
+			} else if (CoreConstants.UNKNOWN.equalsIgnoreCase(m_scanStatus)) { // In case of internet disconnect Status is set to unstable.
+				progress.setStatus(new Message(Message.ERROR, Messages.error_server_unavailable() + " " + Messages.check_server(m_authProvider.getServer())));
+				build.setDescription(Messages.error_server_unavailable());
+				build.setResult(Result.UNSTABLE);
+			} else {
+				provider.setProgress(new StdOutProgress()); //Avoid serialization problem with StreamBuildListener.
+				VariableResolver<String> resolver = build instanceof AbstractBuild ? new BuildVariableResolver((AbstractBuild<?, ?>) build, listener) : null;
+				String asocAppUrl = m_authProvider.getServer() + "/serviceui/main/myapps/portfolio";
+				build.addAction(new ResultsRetriever(build, provider, resolver == null ? m_name : Util.replaceMacro(m_name, resolver), asocAppUrl, Messages.label_asoc_homepage()));
+
+				if (m_wait)
+					shouldFailBuild(provider, build);
 			}
-
-			@Override
-			public IResultsProvider call() throws AbortException {
-				try {
-					setInstallDir();
-		    		scan.run();
-		    		
-                                IResultsProvider provider=new NonCompliantIssuesResultProvider(scan.getScanId(), scan.getType(), scan.getServiceProvider(), progress);
-                                provider.setReportFormat(scan.getReportFormat());
-		    		if(suspend) {
-		    			progress.setStatus(new Message(Message.INFO, Messages.analysis_running()));
-		    			m_scanStatus = provider.getStatus();
-		    			
-                                        int requestCounter=0;
-		    			while(m_scanStatus != null && (m_scanStatus.equalsIgnoreCase(CoreConstants.INQUEUE) || m_scanStatus.equalsIgnoreCase(CoreConstants.RUNNING) || m_scanStatus.equalsIgnoreCase(CoreConstants.UNKNOWN)) && requestCounter<10) {
-                                            Thread.sleep(60000);
-                                            if(m_scanStatus.equalsIgnoreCase(CoreConstants.UNKNOWN))
-                                                requestCounter++;   // In case of internet disconnect, polling the server 10 times to check the connection has established 
-                                            else
-                                                requestCounter=0;
-                                            m_scanStatus = provider.getStatus();
-		    			}
-		    		}
-		    		
-		    		return provider;
-		    	}
-		    	catch(ScannerException | InvalidTargetException | InterruptedException e) {
-		    		throw new AbortException(Messages.error_running_scan(e.getLocalizedMessage()));
-		    	}
-			}
-		});
-        
-        if(suspend && m_scanStatus == null) // to address the status in association with Master and Slave congifuration
-            m_scanStatus = provider.getStatus();
-
-    	if (CoreConstants.FAILED.equalsIgnoreCase(m_scanStatus)) {
-			  String message = com.hcl.appscan.sdk.Messages.getMessage(ScanConstants.SCAN_FAILED, " Scan Name: " + scan.getName());
-			  if (provider.getMessage() != null && provider.getMessage().trim().length() > 0) {
-				  message += ", " + provider.getMessage();
-			  }
-			  build.setDescription(message);
-			  throw new AbortException(com.hcl.appscan.sdk.Messages.getMessage(ScanConstants.SCAN_FAILED, (" Scan Id: " + scan.getScanId() +
-					", Scan Name: " + scan.getName())));
-		  }
-        else if (CoreConstants.UNKNOWN.equalsIgnoreCase(m_scanStatus)) { // In case of internet disconnect Status is set to unstable.
-            progress.setStatus(new Message(Message.ERROR, Messages.error_server_unavailable() + " "+ Messages.check_server(m_authProvider.getServer())));
-            build.setDescription(Messages.error_server_unavailable());
-            build.setResult(Result.UNSTABLE);
-        }
-        else {
-      provider.setProgress(new StdOutProgress()); //Avoid serialization problem with StreamBuildListener.
-      VariableResolver<String> resolver = build instanceof AbstractBuild ? new BuildVariableResolver((AbstractBuild<?,?>)build, listener) : null;
-    	String asocAppUrl = m_authProvider.getServer() + "/serviceui/main/myapps/portfolio";
-		  build.addAction(new ResultsRetriever(build, provider, resolver == null ? m_name : Util.replaceMacro(m_name, resolver), asocAppUrl, Messages.label_asoc_homepage()));
-                
-        if(m_wait)
-            shouldFailBuild(provider,build);	
-    }
-    }
+	}
     
     private void setInstallDir() {
     	if (SystemUtil.isWindows() && System.getProperty("user.home").toLowerCase().indexOf("system32")>=0) {
@@ -369,7 +369,6 @@ public class AppScanBuildStep extends Builder implements SimpleBuildStep, Serial
 		Items.XSTREAM2.addCompatibilityAlias("com.ibm.appscan.jenkins.plugin.builders.AppScanBuildStep", com.hcl.appscan.jenkins.plugin.builders.AppScanBuildStep.class);
     		Items.XSTREAM2.addCompatibilityAlias("com.ibm.appscan.jenkins.plugin.scanners.StaticAnalyzer", com.hcl.appscan.jenkins.plugin.scanners.StaticAnalyzer.class);
     		Items.XSTREAM2.addCompatibilityAlias("com.ibm.appscan.jenkins.plugin.scanners.DynamicAnalyzer", com.hcl.appscan.jenkins.plugin.scanners.DynamicAnalyzer.class);
-    		Items.XSTREAM2.addCompatibilityAlias("com.ibm.appscan.jenkins.plugin.scanners.MobileAnalyzer", com.hcl.appscan.jenkins.plugin.scanners.MobileAnalyzer.class);
     		Items.XSTREAM2.addCompatibilityAlias("com.hcl.appscan.plugin.core.results.CloudResultsProvider", com.hcl.appscan.sdk.results.CloudResultsProvider.class);
 		Items.XSTREAM2.addCompatibilityAlias("com.hcl.appscan.plugin.core.scan.CloudScanServiceProvider", com.hcl.appscan.sdk.scan.CloudScanServiceProvider.class);
     	}
